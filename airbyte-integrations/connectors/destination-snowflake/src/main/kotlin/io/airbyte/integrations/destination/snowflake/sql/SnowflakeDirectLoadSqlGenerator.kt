@@ -390,6 +390,23 @@ class SnowflakeDirectLoadSqlGenerator(
     ): String =
         """DESCRIBE TABLE ${fullyQualifiedName(TableName(schemaName, tableName))}""".andLog()
 
+    /**
+     * Lists every table in a schema in one metadata query. The schema is quoted the same way as the
+     * per-table `show tables like ?` lookup in the client.
+     */
+    fun showTablesInSchema(namespace: String): String =
+        """SHOW TABLES IN SCHEMA "${getDatabaseName()}"."$namespace"""".andLog()
+
+    /** Lists the tables in a schema whose (case-sensitive) name starts with [prefix]. */
+    fun showTablesStartsWith(prefix: String, namespace: String): String =
+        """SHOW TABLES STARTS WITH '${escapeStringLiteral(prefix)}' IN SCHEMA "${getDatabaseName()}"."$namespace"""".andLog()
+
+    fun commentOnTable(tableName: TableName, comment: String): String =
+        "COMMENT ON TABLE ${fullyQualifiedName(tableName)} IS '${escapeStringLiteral(comment)}'".andLog()
+
+    private fun escapeStringLiteral(value: String): String =
+        value.replace("\\", "\\\\").replace("'", "\\'")
+
     fun alterTable(
         tableName: TableName,
         addedColumns: Map<String, ColumnType>,

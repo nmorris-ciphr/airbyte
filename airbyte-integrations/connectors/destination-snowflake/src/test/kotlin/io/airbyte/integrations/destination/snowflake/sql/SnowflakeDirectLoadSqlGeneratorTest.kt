@@ -1094,4 +1094,34 @@ internal class SnowflakeDirectLoadSqlGeneratorTest {
         """.trimIndent()
         assertEquals(expected, sql)
     }
+
+    @Test
+    fun testShowTablesInSchema() {
+        val sql = snowflakeDirectLoadSqlGenerator.showTablesInSchema("MY_SCHEMA")
+        assertEquals("SHOW TABLES IN SCHEMA \"TEST-DATABASE\".\"MY_SCHEMA\"", sql)
+    }
+
+    @Test
+    fun testShowTablesStartsWith() {
+        val sql =
+            snowflakeDirectLoadSqlGenerator.showTablesStartsWith(
+                "TENANT_Aab'c\\",
+                "airbyte_internal"
+            )
+        assertEquals(
+            "SHOW TABLES STARTS WITH 'TENANT_Aab\\'c\\\\' IN SCHEMA \"TEST-DATABASE\".\"airbyte_internal\"",
+            sql
+        )
+    }
+
+    @Test
+    fun testCommentOnTable() {
+        val tableName = TableName(namespace = "NS", name = "TBL")
+        val sql =
+            snowflakeDirectLoadSqlGenerator.commentOnTable(tableName, "airbyte-schema:v1:it's\\x")
+        assertEquals(
+            "COMMENT ON TABLE \"TEST-DATABASE\".\"NS\".\"TBL\" IS 'airbyte-schema:v1:it\\'s\\\\x'",
+            sql
+        )
+    }
 }

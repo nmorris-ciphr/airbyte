@@ -5,12 +5,24 @@
 package io.airbyte.integrations.destination.snowflake.client
 
 import io.airbyte.cdk.ConfigErrorException
+import io.airbyte.cdk.load.command.Append
 import io.airbyte.cdk.load.command.DestinationStream
 import io.airbyte.cdk.load.component.ColumnType
+import io.airbyte.cdk.load.component.ColumnTypeChange
+import io.airbyte.cdk.load.component.TableSchema
 import io.airbyte.cdk.load.message.Meta.Companion.COLUMN_NAME_AB_GENERATION_ID
 import io.airbyte.cdk.load.message.Meta.Companion.COLUMN_NAME_AB_RAW_ID
+import io.airbyte.cdk.load.schema.model.ColumnSchema
+import io.airbyte.cdk.load.schema.model.StreamTableSchema
 import io.airbyte.cdk.load.schema.model.TableName
+import io.airbyte.cdk.load.schema.model.TableNames
 import io.airbyte.cdk.load.table.ColumnNameMapping
+import io.airbyte.cdk.load.table.DefaultTempTableNameGenerator
+import io.airbyte.cdk.load.table.directload.DirectLoadInitialStatus
+import io.airbyte.cdk.load.table.directload.DirectLoadTableDedupStreamLoader
+import io.airbyte.cdk.load.table.directload.DirectLoadTableDedupTruncateStreamLoader
+import io.airbyte.cdk.load.table.directload.DirectLoadTableStatus
+import io.airbyte.cdk.load.write.StreamStateStore
 import io.airbyte.integrations.destination.snowflake.schema.SnowflakeColumnManager
 import io.airbyte.integrations.destination.snowflake.schema.toSnowflakeCompatibleName
 import io.airbyte.integrations.destination.snowflake.spec.SnowflakeConfiguration
@@ -23,20 +35,24 @@ import io.mockk.mockk
 import io.mockk.runs
 import io.mockk.verify
 import io.mockk.verifyOrder
+import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.sql.SQLException
 import java.sql.Statement
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 import kotlinx.coroutines.runBlocking
 import net.snowflake.client.jdbc.SnowflakeSQLException
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -922,5 +938,446 @@ internal class SnowflakeAirbyteClientTest {
             assertTrue(exception.message!!.contains("current role has no privileges on it"))
             assertTrue(exception.cause is SnowflakeSQLException)
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Fingerprint-gated ensureSchemaMatches
+    // ---------------------------------------------------------------------------------------
+
+    private val fpFinalTable = TableName(namespace = "NS", name = "USERS")
+    private val fpTempTable = TableName(namespace = "airbyte_internal", name = "NSUSERSdeadbeef")
+    private val baseColumns =
+        linkedMapOf(
+            "ID" to ColumnType("NUMBER", true),
+            "NAME" to ColumnType("VARCHAR", true),
+        )
+    private val mapping = ColumnNameMapping(emptyMap())
+
+    /** Fake final/temp table state backing DESCRIBE, plus a log of every executed statement. */
+    private class SchemaDb {
+        val columns = linkedMapOf<String, ColumnType>()
+        val executed: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        var commentFails = false
+        var showTablesRows: List<Triple<String, Long, String?>> = emptyList()
+
+        fun count(prefix: String) = executed.count { it.startsWith(prefix) }
+    }
+
+    private fun installSchemaDb(): SchemaDb {
+        val db = SchemaDb()
+        every { sqlGenerator.describeTable(any(), any()) } answers
+            {
+                "DESCRIBE ${firstArg<String>()}.${secondArg<String>()}"
+            }
+        every { sqlGenerator.commentOnTable(any(), any()) } answers
+            {
+                "COMMENT ${firstArg<TableName>().name} ${secondArg<String>()}"
+            }
+        every { sqlGenerator.alterTable(any(), any(), any()) } answers
+            {
+                val added = secondArg<Map<String, ColumnType>>()
+                val changed = thirdArg<Map<String, ColumnTypeChange>>()
+                (added.keys.map { "ALTER ADD $it" } + changed.keys.map { "ALTER CHANGE $it" })
+                    .toSet()
+            }
+        every { sqlGenerator.createTable(any(), any(), any()) } answers
+            {
+                "CREATE ${firstArg<TableName>().name}"
+            }
+        every { sqlGenerator.createSnowflakeStage(any()) } answers
+            {
+                "STAGE ${firstArg<TableName>().name}"
+            }
+        every { sqlGenerator.putInStage(any(), any()) } answers
+            {
+                "PUT ${firstArg<TableName>().name}"
+            }
+        every { sqlGenerator.upsertTable(any(), any(), any()) } returns "UPSERT"
+        every { sqlGenerator.dropTable(any()) } answers { "DROP ${firstArg<TableName>().name}" }
+        every { sqlGenerator.showTablesInSchema(any()) } answers { "SHOW IN ${firstArg<String>()}" }
+        every { sqlGenerator.showTablesStartsWith(any(), any()) } answers
+            {
+                "SHOW STARTS WITH ${firstArg<String>()}"
+            }
+
+        val statement =
+            mockk<Statement>(relaxed = true) {
+                every { executeQuery(any()) } answers
+                    {
+                        val sql = firstArg<String>()
+                        db.executed.add(sql)
+                        when {
+                            sql.startsWith("DESCRIBE") -> describeResultSet(db.columns)
+                            sql.startsWith("COMMENT") && db.commentFails ->
+                                throw SnowflakeSQLException(
+                                    "Table 'USERS' already exists, but current role has no privileges on it"
+                                )
+                            sql.startsWith("SHOW IN") -> showResultSet(db.showTablesRows)
+                            sql.startsWith("SHOW STARTS WITH") -> showResultSet(emptyList())
+                            else -> mockk(relaxed = true)
+                        }
+                    }
+            }
+        val connection =
+            mockk<Connection>(relaxed = true) { every { createStatement() } returns statement }
+        every { dataSource.connection } returns connection
+        return db
+    }
+
+    private fun describeResultSet(columns: Map<String, ColumnType>): ResultSet {
+        val rows = columns.entries.toList()
+        val index = AtomicInteger(-1)
+        return mockk(relaxed = true) {
+            every { next() } answers { index.incrementAndGet() < rows.size }
+            every { getString("name") } answers { rows[index.get()].key }
+            every { getString("type") } answers { rows[index.get()].value.type }
+            every { getString("null?") } answers
+                {
+                    if (rows[index.get()].value.nullable) "Y" else "N"
+                }
+        }
+    }
+
+    private fun showResultSet(rows: List<Triple<String, Long, String?>>): ResultSet {
+        val index = AtomicInteger(-1)
+        return mockk(relaxed = true) {
+            every { next() } answers { index.incrementAndGet() < rows.size }
+            every { getString("name") } answers { rows[index.get()].first }
+            every { getLong("rows") } answers { rows[index.get()].second }
+            every { getString("comment") } answers { rows[index.get()].third }
+        }
+    }
+
+    private fun schemaStream(columns: Map<String, ColumnType>): DestinationStream =
+        mockk(relaxed = true) {
+            every { tableSchema } returns
+                StreamTableSchema(
+                    tableNames =
+                        TableNames(finalTableName = fpFinalTable, tempTableName = fpTempTable),
+                    columnSchema =
+                        ColumnSchema(
+                            inputSchema = emptyMap(),
+                            inputToFinalColumnNames = emptyMap(),
+                            finalSchema = columns,
+                        ),
+                    importType = Append,
+                )
+            every { mappedDescriptor } returns DestinationStream.Descriptor("NS", "USERS")
+        }
+
+    private fun fingerprintOf(columns: Map<String, ColumnType>) =
+        client.computeFingerprint(TableSchema(columns))
+
+    private fun withEmail(columns: Map<String, ColumnType>) =
+        LinkedHashMap(columns).apply { put("EMAIL", ColumnType("VARCHAR", true)) }
+
+    @Test
+    fun testEnsureSchemaMatchesSkipsWhenFingerprintMatchesAndTempPending() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        client.lastBatchComments[fpFinalTable] = fingerprintOf(baseColumns)
+
+        runBlocking {
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            client.ensureSchemaMatches(stream, fpFinalTable, mapping)
+        }
+
+        assertEquals(emptyList<String>(), db.executed.toList())
+        assertEquals(1L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testEnsureSchemaMatchesReconcilesWhenFingerprintMissing() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        val expected = fingerprintOf(baseColumns)
+
+        runBlocking {
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            client.ensureSchemaMatches(stream, fpFinalTable, mapping)
+        }
+
+        assertEquals(listOf("DESCRIBE NS.USERS", "COMMENT USERS $expected"), db.executed.toList())
+        assertEquals(expected, client.lastBatchComments[fpFinalTable])
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testEnsureSchemaMatchesReconcilesWhenFingerprintDiffers() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        val expected = fingerprintOf(baseColumns)
+        client.lastBatchComments[fpFinalTable] =
+            fingerprintOf(mapOf("ID" to ColumnType("NUMBER", true)))
+
+        runBlocking {
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            client.ensureSchemaMatches(stream, fpFinalTable, mapping)
+        }
+
+        assertEquals(listOf("DESCRIBE NS.USERS", "COMMENT USERS $expected"), db.executed.toList())
+        assertEquals(expected, client.lastBatchComments[fpFinalTable])
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testEnsureSchemaMatchesReconcilesWhenCommentNotInExpectedFormat() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        val expected = fingerprintOf(baseColumns)
+        // The comment carries the right hash but not the versioned prefix (e.g. a user comment).
+        db.showTablesRows =
+            listOf(Triple("USERS", 5L, expected.removePrefix(SCHEMA_FINGERPRINT_PREFIX)))
+
+        runBlocking {
+            client.batchGatherTableStatus(listOf(stream))
+            assertNull(client.lastBatchComments[fpFinalTable])
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            client.ensureSchemaMatches(stream, fpFinalTable, mapping)
+        }
+
+        assertEquals(1, db.count("DESCRIBE"))
+        assertEquals(1, db.count("COMMENT USERS $expected"))
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testEnsureSchemaMatchesReconcilesWhenTempNotPending() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        client.lastBatchComments[fpFinalTable] = fingerprintOf(baseColumns)
+
+        runBlocking {
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            // A record was written, so the temp table is materialized.
+            client.putInStage(fpTempTable, "/tmp/data.csv")
+            client.ensureSchemaMatches(stream, fpFinalTable, mapping)
+        }
+
+        assertEquals(1, db.count("DESCRIBE NS.USERS"))
+        // The fingerprint already matches, so the comment is not rewritten.
+        assertEquals(0, db.count("COMMENT"))
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testEnsureSchemaMatchesSkipDoesNotApplyToTempTable() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        val expected = fingerprintOf(baseColumns)
+        client.lastBatchComments[fpFinalTable] = expected
+        client.lastBatchComments[fpTempTable] = expected
+
+        runBlocking {
+            client.createTempTable(stream, fpTempTable, mapping, replace = true)
+            client.ensureSchemaMatches(stream, fpTempTable, mapping)
+        }
+
+        assertEquals(listOf("DESCRIBE airbyte_internal.NSUSERSdeadbeef"), db.executed.toList())
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testCommentWrittenOnlyWhenFingerprintChanges() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        client.lastBatchComments[fpFinalTable] = fingerprintOf(baseColumns)
+
+        // Temp not pending (records written): reconcile runs, but the comment is already right.
+        runBlocking { client.ensureSchemaMatches(schemaStream(baseColumns), fpFinalTable, mapping) }
+        assertEquals(0, db.count("COMMENT"))
+
+        val newColumns = withEmail(baseColumns)
+        val changed = schemaStream(newColumns)
+        runBlocking {
+            client.ensureSchemaMatches(changed, fpFinalTable, mapping)
+            db.columns["EMAIL"] = ColumnType("VARCHAR", true)
+            client.ensureSchemaMatches(changed, fpFinalTable, mapping)
+        }
+
+        assertEquals(
+            listOf("COMMENT USERS ${fingerprintOf(newColumns)}"),
+            db.executed.filter { it.startsWith("COMMENT") },
+        )
+        assertEquals(3, db.count("DESCRIBE"))
+    }
+
+    @Test
+    fun testFingerprintDeterministicAndOrderedByColumnName() {
+        val forward =
+            linkedMapOf(
+                "A_COL" to ColumnType("VARCHAR", true),
+                "B_COL" to ColumnType("NUMBER", false),
+            )
+        val reversed =
+            linkedMapOf(
+                "B_COL" to ColumnType("NUMBER", false),
+                "A_COL" to ColumnType("VARCHAR", true),
+            )
+        val fingerprint = fingerprintOf(forward)
+
+        val sha =
+            MessageDigest.getInstance("SHA-256")
+                .digest("A_COL|VARCHAR|true\nB_COL|NUMBER|false".toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+        assertEquals("airbyte-schema:v1:${sha.take(16)}", fingerprint)
+        assertTrue(Regex("^airbyte-schema:v1:[0-9a-f]{16}$").matches(fingerprint))
+        assertEquals(fingerprint, fingerprintOf(reversed))
+        assertEquals(fingerprint, fingerprintOf(LinkedHashMap(forward)))
+        assertTrue(
+            fingerprint !=
+                fingerprintOf(
+                    linkedMapOf(
+                        "A_COL" to ColumnType("VARCHAR", false),
+                        "B_COL" to ColumnType("NUMBER", false),
+                    )
+                ),
+            "nullability must affect the fingerprint",
+        )
+        assertTrue(
+            fingerprint !=
+                fingerprintOf(
+                    linkedMapOf(
+                        "A_COL" to ColumnType("VARIANT", true),
+                        "B_COL" to ColumnType("NUMBER", false),
+                    )
+                ),
+            "type must affect the fingerprint",
+        )
+    }
+
+    private fun runZeroRecordTruncateSync(storedFingerprint: String?): SchemaDb {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val stream = schemaStream(baseColumns)
+        storedFingerprint?.let { client.lastBatchComments[fpFinalTable] = it }
+        val loader =
+            DirectLoadTableDedupTruncateStreamLoader(
+                stream,
+                DirectLoadInitialStatus(
+                    realTable = DirectLoadTableStatus(isEmpty = true),
+                    tempTable = null,
+                ),
+                realTableName = fpFinalTable,
+                tempTableName = fpTempTable,
+                mapping,
+                client,
+                client,
+                StreamStateStore(),
+                DefaultTempTableNameGenerator("airbyte_internal"),
+            )
+        runBlocking {
+            loader.start()
+            loader.teardown(completedSuccessfully = true)
+        }
+        return db
+    }
+
+    @Test
+    fun testTruncateModeSkipsOnlyWithMatchingFingerprint() {
+        val matching = runZeroRecordTruncateSync(fingerprintOf(baseColumns))
+        assertEquals(emptyList<String>(), matching.executed.toList())
+        assertEquals(1L, client.schemaCheckSkipCount.get())
+
+        setup()
+        val stale =
+            runZeroRecordTruncateSync(fingerprintOf(mapOf("ID" to ColumnType("NUMBER", true))))
+        assertEquals(1, stale.count("DESCRIBE NS.USERS"))
+        assertEquals(1, stale.count("COMMENT USERS ${fingerprintOf(baseColumns)}"))
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+
+        setup()
+        val missing = runZeroRecordTruncateSync(null)
+        assertEquals(1, missing.count("DESCRIBE NS.USERS"))
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    private fun dedupLoader(stream: DestinationStream) =
+        DirectLoadTableDedupStreamLoader(
+            stream,
+            DirectLoadInitialStatus(
+                realTable = DirectLoadTableStatus(isEmpty = false),
+                tempTable = null,
+            ),
+            realTableName = fpFinalTable,
+            tempTableName = fpTempTable,
+            mapping,
+            client,
+            client,
+            StreamStateStore(),
+        )
+
+    @Test
+    fun testPropagateColumnsFirstNonEmptySyncAfterCatalogChange() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        // The table was fingerprinted for the old catalog; the new catalog adds EMAIL.
+        client.lastBatchComments[fpFinalTable] = fingerprintOf(baseColumns)
+        val newColumns = withEmail(baseColumns)
+        val loader = dedupLoader(schemaStream(newColumns))
+
+        runBlocking {
+            loader.start()
+            client.putInStage(fpTempTable, "/tmp/data.csv")
+            loader.teardown(completedSuccessfully = true)
+        }
+
+        val executed = db.executed.toList()
+        assertTrue(
+            executed.indexOf("ALTER ADD EMAIL") in 0 until executed.indexOf("UPSERT"),
+            "$executed"
+        )
+        assertEquals(1, db.count("COMMENT USERS ${fingerprintOf(newColumns)}"))
+        assertEquals(fingerprintOf(newColumns), client.lastBatchComments[fpFinalTable])
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testCatalogChangeOnZeroRecordStreamReconciles() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        // Stale fingerprint + zero records: the temp table stays pending, but must not skip.
+        client.lastBatchComments[fpFinalTable] = fingerprintOf(baseColumns)
+        val newColumns = withEmail(baseColumns)
+        val loader = dedupLoader(schemaStream(newColumns))
+
+        runBlocking {
+            loader.start()
+            loader.teardown(completedSuccessfully = true)
+        }
+
+        assertEquals(
+            listOf(
+                "DESCRIBE NS.USERS",
+                "ALTER ADD EMAIL",
+                "COMMENT USERS ${fingerprintOf(newColumns)}",
+            ),
+            db.executed.toList(),
+        )
+        assertEquals(0L, client.schemaCheckSkipCount.get())
+    }
+
+    @Test
+    fun testCommentFailureDoesNotFailSync() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        db.commentFails = true
+        val loader = dedupLoader(schemaStream(baseColumns))
+
+        runBlocking {
+            loader.start()
+            loader.teardown(completedSuccessfully = true)
+        }
+
+        assertEquals(1, db.count("DESCRIBE NS.USERS"))
+        assertEquals(1, db.count("COMMENT"))
+        // Not recorded, so the next sync reconciles again.
+        assertNull(client.lastBatchComments[fpFinalTable])
     }
 }

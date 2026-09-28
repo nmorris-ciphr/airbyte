@@ -21,20 +21,39 @@ import io.airbyte.integrations.destination.snowflake.schema.SnowflakeColumnManag
 import io.airbyte.integrations.destination.snowflake.schema.toSnowflakeCompatibleName
 import io.airbyte.integrations.destination.snowflake.spec.SnowflakeConfiguration
 import io.airbyte.integrations.destination.snowflake.sql.COUNT_TOTAL_ALIAS
+import io.airbyte.integrations.destination.snowflake.sql.QUOTE
 import io.airbyte.integrations.destination.snowflake.sql.SnowflakeDirectLoadSqlGenerator
 import io.airbyte.integrations.destination.snowflake.sql.andLog
 import io.airbyte.integrations.destination.snowflake.sql.escapeJsonIdentifier
 import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.inject.Singleton
+import java.security.MessageDigest
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import javax.sql.DataSource
 import net.snowflake.client.jdbc.SnowflakeSQLException
 
 internal const val DESCRIBE_TABLE_COLUMN_NAME_FIELD = "column_name"
 internal const val DESCRIBE_TABLE_COLUMN_TYPE_FIELD = "data_type"
 
+/** Prefix of the table comment used to record the catalog-derived schema fingerprint. */
+internal const val SCHEMA_FINGERPRINT_PREFIX = "airbyte-schema:v1:"
+
+/**
+ * SHOW commands return at most this many rows. A result of this size may be truncated, so the
+ * batched lookup falls back to per-table queries for that group.
+ */
+internal const val SHOW_TABLES_ROW_CAP = 10_000
+
+/** Must match the affix length used by the configured DefaultTempTableNameGenerator. */
+private const val TEMP_TABLE_NAMESPACE_AFFIX_LENGTH = 8
+
 private val log = KotlinLogging.logger {}
+
+/** One row of a batched SHOW TABLES result. */
+internal data class TableStatusEntry(val rows: Long, val comment: String?)
 
 @Singleton
 @SuppressFBWarnings(value = ["NP_NONNULL_PARAM_VIOLATION"], justification = "kotlin coroutines")
@@ -60,6 +79,170 @@ class SnowflakeAirbyteClient(
      * of stage creation.
      */
     private val pendingTempTables = ConcurrentHashMap<TableName, PendingTempTable>()
+
+    /**
+     * Schema fingerprints read from table comments by [batchGatherTableStatus], or written by
+     * [ensureSchemaMatches]. Only comments in the [SCHEMA_FINGERPRINT_PREFIX] format are kept; an
+     * absent key means "no known fingerprint" (ConcurrentHashMap cannot hold null values).
+     */
+    internal val lastBatchComments = ConcurrentHashMap<TableName, String>()
+
+    /** Number of ensureSchemaMatches calls skipped because the fingerprint matched. */
+    val schemaCheckSkipCount = AtomicLong()
+
+    /** Number of batched SHOW groups that fell back to per-table lookups (any cause). */
+    val batchFallbackCount = AtomicLong()
+    val batchFallbackCapCount = AtomicLong()
+    val batchFallbackErrorCount = AtomicLong()
+
+    /** A single batched SHOW TABLES query and the tables whose status it resolves. */
+    private data class ShowTablesGroup(val sql: String, val tables: List<TableName>)
+
+    /**
+     * Resolves the status of every final and temp table of [streams] with one SHOW TABLES per final
+     * namespace, plus one SHOW TABLES STARTS WITH per temp-table prefix in the internal namespace.
+     *
+     * The returned map contains:
+     * - `table -> entry` when the table was found,
+     * - `table -> null` when a successful SHOW did not list it (missing table),
+     * - no key when its group fell back (row cap reached or SQL error); callers must resolve such
+     * tables with [countTable].
+     *
+     * Name matching: an exact (case-sensitive) name match is preferred; otherwise a
+     * case-insensitive match is used, mirroring the case-insensitivity of the previous `SHOW TABLES
+     * LIKE ?` lookup (but without its `_`/`%` wildcard matching, which could match other tables).
+     */
+    internal suspend fun batchGatherTableStatus(
+        streams: Collection<DestinationStream>
+    ): Map<TableName, TableStatusEntry?> {
+        val finalTables = streams.mapNotNull { it.tableSchema.tableNames.finalTableName }.toSet()
+        val tempTables = streams.mapNotNull { it.tableSchema.tableNames.tempTableName }.toSet()
+        val finalNamespaces = finalTables.map { it.namespace }.toSet()
+
+        val groups =
+            (finalTables + tempTables)
+                .groupBy { it.namespace }
+                .flatMap { (namespace, tables) ->
+                    if (namespace in finalNamespaces) {
+                        listOf(ShowTablesGroup(sqlGenerator.showTablesInSchema(namespace), tables))
+                    } else {
+                        tempTableGroups(namespace, tables, streams)
+                    }
+                }
+
+        val result = HashMap<TableName, TableStatusEntry?>()
+        groups.forEach { group ->
+            val listing = runShowTables(group.sql) ?: return@forEach
+            group.tables.forEach { table -> result[table] = listing.lookup(table.name) }
+        }
+
+        result.forEach { (table, entry) ->
+            val comment = entry?.comment
+            if (comment != null && comment.startsWith(SCHEMA_FINGERPRINT_PREFIX)) {
+                lastBatchComments[table] = comment
+            } else {
+                lastBatchComments.remove(table)
+            }
+        }
+        return result
+    }
+
+    /**
+     * Temp tables live in a shared internal namespace. Their names start with the first and last
+     * [TEMP_TABLE_NAMESPACE_AFFIX_LENGTH] characters of the final namespace, so each distinct
+     * prefix is listed with SHOW TABLES STARTS WITH. The prefix is verified against the actual temp
+     * table name; if any table cannot be given a safe prefix, the whole namespace is listed
+     * instead.
+     */
+    private fun tempTableGroups(
+        namespace: String,
+        tables: List<TableName>,
+        streams: Collection<DestinationStream>,
+    ): List<ShowTablesGroup> {
+        val finalNamespaceByTemp =
+            streams
+                .mapNotNull { stream ->
+                    val names = stream.tableSchema.tableNames
+                    val temp = names.tempTableName ?: return@mapNotNull null
+                    val final = names.finalTableName ?: return@mapNotNull null
+                    temp to final.namespace
+                }
+                .toMap()
+
+        val prefixes =
+            tables.associateWith { table ->
+                finalNamespaceByTemp[table]
+                    ?.let { tempTablePrefix(it) }
+                    ?.takeIf { it.isNotEmpty() && !it.contains(QUOTE) && table.name.startsWith(it) }
+            }
+
+        if (prefixes.values.any { it == null }) {
+            log.info {
+                "Cannot derive a safe temp table prefix in namespace $namespace; listing the whole schema"
+            }
+            return listOf(ShowTablesGroup(sqlGenerator.showTablesInSchema(namespace), tables))
+        }
+        return prefixes.entries.groupBy({ it.value!! }, { it.key }).map { (prefix, prefixTables) ->
+            ShowTablesGroup(sqlGenerator.showTablesStartsWith(prefix, namespace), prefixTables)
+        }
+    }
+
+    private fun tempTablePrefix(finalNamespace: String): String {
+        val n = TEMP_TABLE_NAMESPACE_AFFIX_LENGTH
+        return if (finalNamespace.length <= 2 * n) {
+            finalNamespace
+        } else {
+            finalNamespace.take(n) + finalNamespace.takeLast(n)
+        }
+    }
+
+    private class ShowTablesListing(private val byName: Map<String, TableStatusEntry>) {
+        private val byUppercaseName: Map<String, TableStatusEntry> =
+            byName.entries
+                .groupBy { it.key.uppercase() }
+                .mapValues { (_, entries) -> entries.first().value }
+
+        fun lookup(name: String): TableStatusEntry? =
+            byName[name] ?: byUppercaseName[name.uppercase()]
+    }
+
+    /**
+     * Runs a SHOW TABLES query. Returns null (after recording a fallback) if the result may be
+     * truncated or the query fails.
+     */
+    private fun runShowTables(sql: String): ShowTablesListing? {
+        try {
+            val entries = LinkedHashMap<String, TableStatusEntry>()
+            var rowCount = 0
+            dataSource.connection.use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.executeQuery(sql).use { rs ->
+                        while (rs.next()) {
+                            rowCount++
+                            entries.putIfAbsent(
+                                rs.getString("name"),
+                                TableStatusEntry(rs.getLong("rows"), rs.getString("comment")),
+                            )
+                        }
+                    }
+                }
+            }
+            if (rowCount >= SHOW_TABLES_ROW_CAP) {
+                batchFallbackCount.incrementAndGet()
+                batchFallbackCapCount.incrementAndGet()
+                log.warn {
+                    "Batched table lookup returned $rowCount rows (cap $SHOW_TABLES_ROW_CAP); falling back to per-table lookups"
+                }
+                return null
+            }
+            return ShowTablesListing(entries)
+        } catch (e: SQLException) {
+            batchFallbackCount.incrementAndGet()
+            batchFallbackErrorCount.incrementAndGet()
+            log.warn(e) { "Batched table lookup failed; falling back to per-table lookups" }
+            return null
+        }
+    }
 
     override suspend fun countTable(tableName: TableName): Long? {
         return getTableRowCount(tableName)
@@ -262,7 +445,56 @@ class SnowflakeAirbyteClient(
         if (snowflakeConfiguration.legacyRawTablesOnly) {
             return
         }
+
+        /*
+         * The final table's comment records the fingerprint of the catalog-derived schema that was
+         * last reconciled into it. If it equals the expected fingerprint, DESCRIBE + ALTER would be
+         * a no-op, which is what makes the skip safe in every loader mode. The skip is further
+         * narrowed to streams whose temp table is still unmaterialized (zero-record streams).
+         */
+        val names = stream.tableSchema.tableNames
+        val expected = computeFingerprint(computeSchema(stream, columnNameMapping))
+        val isFinalTable = tableName == names.finalTableName
+        if (
+            isFinalTable &&
+                names.tempTableName?.let { isPendingTempTable(it) } == true &&
+                lastBatchComments[tableName] == expected
+        ) {
+            schemaCheckSkipCount.incrementAndGet()
+            log.info {
+                "Skipping schema check for ${tableName.toPrettyString()}: schema fingerprint $expected matches and no records were written"
+            }
+            return
+        }
+
         super.ensureSchemaMatches(stream, tableName, columnNameMapping)
+
+        if (isFinalTable && lastBatchComments[tableName] != expected) {
+            try {
+                execute(sqlGenerator.commentOnTable(tableName, expected))
+                lastBatchComments[tableName] = expected
+            } catch (e: Exception) {
+                // Not fatal: without a fingerprint the next sync simply reconciles again.
+                log.warn(e) {
+                    "Failed to record schema fingerprint on ${tableName.toPrettyString()}; the next sync will re-check its schema"
+                }
+            }
+        }
+    }
+
+    /**
+     * Deterministic fingerprint of a table schema: [SCHEMA_FINGERPRINT_PREFIX] followed by the
+     * first 16 hex chars of SHA-256 over `name|type|nullable` lines, sorted by column name.
+     */
+    internal fun computeFingerprint(schema: TableSchema): String {
+        val canonical =
+            schema.columns.entries
+                .sortedBy { it.key }
+                .joinToString("\n") { (name, type) -> "$name|${type.type}|${type.nullable}" }
+        val digest =
+            MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
+        val hex = digest.joinToString("") { "%02x".format(it) }
+        return SCHEMA_FINGERPRINT_PREFIX + hex.take(16)
     }
 
     override suspend fun discoverSchema(tableName: TableName): TableSchema {

@@ -23,7 +23,10 @@ import io.airbyte.cdk.load.write.StreamStateStore
 import io.airbyte.integrations.destination.snowflake.client.SnowflakeAirbyteClient
 import io.airbyte.integrations.destination.snowflake.spec.SnowflakeConfiguration
 import io.airbyte.integrations.destination.snowflake.sql.escapeJsonIdentifier
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.inject.Singleton
+
+private val log = KotlinLogging.logger {}
 
 @Singleton
 class SnowflakeWriter(
@@ -47,6 +50,16 @@ class SnowflakeWriter(
         )
 
         initialStatuses = stateGatherer.gatherInitialStatus()
+    }
+
+    override suspend fun teardown(hadFailure: Boolean) {
+        log.info {
+            "Snowflake metadata summary: " +
+                "schemaChecksSkipped=${snowflakeClient.schemaCheckSkipCount.get()} " +
+                "batchFallbacks=${snowflakeClient.batchFallbackCount.get()} " +
+                "(cap=${snowflakeClient.batchFallbackCapCount.get()}, " +
+                "error=${snowflakeClient.batchFallbackErrorCount.get()})"
+        }
     }
 
     override fun createStreamLoader(stream: DestinationStream): StreamLoader {
