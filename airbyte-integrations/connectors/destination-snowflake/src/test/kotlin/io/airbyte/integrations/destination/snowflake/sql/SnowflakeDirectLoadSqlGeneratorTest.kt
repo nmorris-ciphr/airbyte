@@ -1109,7 +1109,8 @@ internal class SnowflakeDirectLoadSqlGeneratorTest {
                 "airbyte_internal"
             )
         assertEquals(
-            "SHOW TABLES STARTS WITH 'TENANT_Aab\\'c\\\\' IN SCHEMA \"TEST-DATABASE\".\"airbyte_internal\"",
+            // Snowflake requires IN before STARTS WITH; the reverse is a syntax error.
+            "SHOW TABLES IN SCHEMA \"TEST-DATABASE\".\"airbyte_internal\" STARTS WITH 'TENANT_Aab\\'c\\\\'",
             sql
         )
     }

@@ -399,7 +399,7 @@ class SnowflakeDirectLoadSqlGenerator(
 
     /** Lists the tables in a schema whose (case-sensitive) name starts with [prefix]. */
     fun showTablesStartsWith(prefix: String, namespace: String): String =
-        """SHOW TABLES STARTS WITH '${escapeStringLiteral(prefix)}' IN SCHEMA "${getDatabaseName()}"."$namespace"""".andLog()
+        """SHOW TABLES IN SCHEMA "${getDatabaseName()}"."$namespace" STARTS WITH '${escapeStringLiteral(prefix)}'""".andLog()
 
     fun commentOnTable(tableName: TableName, comment: String): String =
         "COMMENT ON TABLE ${fullyQualifiedName(tableName)} IS '${escapeStringLiteral(comment)}'".andLog()
