@@ -957,7 +957,10 @@ internal class SnowflakeAirbyteClientTest {
     private class SchemaDb {
         val columns = linkedMapOf<String, ColumnType>()
         val executed: MutableList<String> = Collections.synchronizedList(mutableListOf())
-        var commentFails = false
+        var commentFailure: SQLException? = null
+        var alterFails = false
+        var storedComment: String? = null
+        val plannedColumns = mutableMapOf<String, ColumnType>()
         var showTablesRows: List<Triple<String, Long, String?>> = emptyList()
 
         fun count(prefix: String) = executed.count { it.startsWith(prefix) }
@@ -977,6 +980,8 @@ internal class SnowflakeAirbyteClientTest {
             {
                 val added = secondArg<Map<String, ColumnType>>()
                 val changed = thirdArg<Map<String, ColumnTypeChange>>()
+                db.plannedColumns.putAll(added)
+                db.plannedColumns.putAll(changed.mapValues { it.value.newType })
                 (added.keys.map { "ALTER ADD $it" } + changed.keys.map { "ALTER CHANGE $it" })
                     .toSet()
             }
@@ -1008,10 +1013,17 @@ internal class SnowflakeAirbyteClientTest {
                         db.executed.add(sql)
                         when {
                             sql.startsWith("DESCRIBE") -> describeResultSet(db.columns)
-                            sql.startsWith("COMMENT") && db.commentFails ->
-                                throw SnowflakeSQLException(
-                                    "Table 'USERS' already exists, but current role has no privileges on it"
-                                )
+                            sql.startsWith("ALTER") -> {
+                                if (db.alterFails) throw SQLException("DDL was rejected")
+                                val column = sql.substringAfterLast(' ')
+                                db.columns[column] = db.plannedColumns.getValue(column)
+                                mockk(relaxed = true)
+                            }
+                            sql.startsWith("COMMENT") -> {
+                                db.commentFailure?.let { throw it }
+                                db.storedComment = sql.substringAfterLast(' ')
+                                mockk(relaxed = true)
+                            }
                             sql.startsWith("SHOW IN") -> showResultSet(db.showTablesRows)
                             sql.startsWith("SHOW STARTS WITH") -> showResultSet(emptyList())
                             else -> mockk(relaxed = true)
@@ -1197,7 +1209,6 @@ internal class SnowflakeAirbyteClientTest {
         val changed = schemaStream(newColumns)
         runBlocking {
             client.ensureSchemaMatches(changed, fpFinalTable, mapping)
-            db.columns["EMAIL"] = ColumnType("VARCHAR", true)
             client.ensureSchemaMatches(changed, fpFinalTable, mapping)
         }
 
@@ -1364,20 +1375,122 @@ internal class SnowflakeAirbyteClientTest {
     }
 
     @Test
-    fun testCommentFailureDoesNotFailSync() {
+    fun testSchemaFailureLeavesBothFingerprintsUnchangedAndRetrySucceeds() {
         val db = installSchemaDb()
         db.columns.putAll(baseColumns)
-        db.commentFails = true
-        val loader = dedupLoader(schemaStream(baseColumns))
+        val oldFingerprint = fingerprintOf(baseColumns)
+        db.storedComment = oldFingerprint
+        client.lastBatchComments[fpFinalTable] = oldFingerprint
+        val changedColumns = withEmail(baseColumns)
+        val changedStream = schemaStream(changedColumns)
+        db.alterFails = true
 
+        val exception =
+            assertThrows<SQLException> {
+                runBlocking {
+                    val loader = dedupLoader(changedStream)
+                    loader.start()
+                    loader.teardown(completedSuccessfully = true)
+                }
+            }
+
+        assertEquals("DDL was rejected", exception.message)
+        assertEquals(baseColumns, db.columns)
+        assertEquals(oldFingerprint, db.storedComment)
+        assertEquals(oldFingerprint, client.lastBatchComments[fpFinalTable])
+        assertEquals(0, db.count("COMMENT"))
+        assertEquals(0, db.count("UPSERT"))
+
+        db.alterFails = false
         runBlocking {
+            val loader = dedupLoader(changedStream)
             loader.start()
             loader.teardown(completedSuccessfully = true)
         }
 
-        assertEquals(1, db.count("DESCRIBE NS.USERS"))
+        val expected = fingerprintOf(changedColumns)
+        assertEquals(changedColumns, runBlocking { client.discoverSchema(fpFinalTable) }.columns)
+        assertEquals(expected, db.storedComment)
+        assertEquals(expected, client.lastBatchComments[fpFinalTable])
         assertEquals(1, db.count("COMMENT"))
-        // Not recorded, so the next sync reconciles again.
+
+        // A later run recovers the persisted marker instead of relying on the old cache.
+        client.lastBatchComments.clear()
+        db.showTablesRows = listOf(Triple("USERS", 1L, db.storedComment))
+        runBlocking {
+            client.batchGatherTableStatus(listOf(changedStream))
+            val loader = dedupLoader(changedStream)
+            loader.start()
+            loader.teardown(completedSuccessfully = true)
+        }
+        assertEquals(db.storedComment, client.lastBatchComments[fpFinalTable])
+        assertEquals(1L, client.schemaCheckSkipCount.get())
+        assertEquals(1, db.count("COMMENT"))
+    }
+
+    @Test
+    fun testCommentPermissionFailureStopsSyncAndRetryUpdatesBothMarkers() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val oldFingerprint = fingerprintOf(baseColumns)
+        db.storedComment = oldFingerprint
+        client.lastBatchComments[fpFinalTable] = oldFingerprint
+        db.commentFailure =
+            SnowflakeSQLException(
+                "Table 'USERS' already exists, but current role has no privileges on it"
+            )
+        val changedColumns = withEmail(baseColumns)
+        val changedStream = schemaStream(changedColumns)
+
+        val exception =
+            assertThrows<ConfigErrorException> {
+                runBlocking {
+                    val loader = dedupLoader(changedStream)
+                    loader.start()
+                    loader.teardown(completedSuccessfully = true)
+                }
+            }
+
+        assertTrue(exception.message!!.contains("USERS"))
+        assertTrue(exception.message!!.contains("test_database", ignoreCase = true))
+        assertTrue(exception.cause!!.cause is SnowflakeSQLException)
+        assertEquals(changedColumns, runBlocking { client.discoverSchema(fpFinalTable) }.columns)
+        assertEquals(oldFingerprint, db.storedComment)
+        assertEquals(oldFingerprint, client.lastBatchComments[fpFinalTable])
+        assertEquals(0, db.count("UPSERT"))
+
+        db.commentFailure = null
+        runBlocking {
+            val loader = dedupLoader(changedStream)
+            loader.start()
+            loader.teardown(completedSuccessfully = true)
+        }
+
+        val expected = fingerprintOf(changedColumns)
+        assertEquals(expected, db.storedComment)
+        assertEquals(expected, client.lastBatchComments[fpFinalTable])
+        assertEquals(1, db.count("ALTER ADD EMAIL"))
+        assertEquals(2, db.count("COMMENT"))
+    }
+
+    @Test
+    fun testCommentSqlFailureNamesTableAndPreservesCause() {
+        val db = installSchemaDb()
+        db.columns.putAll(baseColumns)
+        val cause = SQLException("connection unavailable")
+        db.commentFailure = cause
+
+        val exception =
+            assertThrows<IllegalStateException> {
+                runBlocking {
+                    client.ensureSchemaMatches(schemaStream(baseColumns), fpFinalTable, mapping)
+                }
+            }
+
+        assertTrue(exception.message!!.contains("USERS"))
+        assertTrue(exception.message!!.contains("test_database", ignoreCase = true))
+        assertEquals(cause, exception.cause)
+        assertNull(db.storedComment)
         assertNull(client.lastBatchComments[fpFinalTable])
     }
 }

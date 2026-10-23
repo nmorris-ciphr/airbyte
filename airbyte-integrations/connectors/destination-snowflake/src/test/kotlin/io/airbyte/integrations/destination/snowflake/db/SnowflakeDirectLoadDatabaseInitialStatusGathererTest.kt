@@ -37,6 +37,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 
 /**
  * Exercises the batched initial status gatherer against a fake Snowflake at the JDBC level. The
@@ -136,9 +137,12 @@ internal class SnowflakeDirectLoadDatabaseInitialStatusGathererTest {
         }
     }
 
-    private fun stream(namespace: String, name: String): DestinationStream {
+    private fun stream(
+        namespace: String,
+        name: String,
+        tempTable: TableName = tempTableNameGenerator.generate(TableName(namespace, name)),
+    ): DestinationStream {
         val finalTable = TableName(namespace, name)
-        val tempTable = tempTableNameGenerator.generate(finalTable)
         return mockk(relaxed = true) {
             every { tableSchema } returns
                 StreamTableSchema(
@@ -160,11 +164,7 @@ internal class SnowflakeDirectLoadDatabaseInitialStatusGathererTest {
     }
 
     private fun gatherer(streams: List<DestinationStream>) =
-        SnowflakeDirectLoadDatabaseInitialStatusGatherer(
-            client,
-            DestinationCatalog(streams),
-            client,
-        )
+        SnowflakeDirectLoadDatabaseInitialStatusGatherer(DestinationCatalog(streams), client)
 
     private fun perTableGatherer(streams: List<DestinationStream>) =
         object : BaseDirectLoadInitialStatusGatherer(client, DestinationCatalog(streams)) {}
@@ -200,7 +200,6 @@ internal class SnowflakeDirectLoadDatabaseInitialStatusGathererTest {
         )
         assertEquals(6, executedQueries.size, "Each SHOW must run exactly once: $executedQueries")
         assertTrue(executedQueries.none { it.startsWith("LIKE") })
-        assertEquals(0L, client.batchFallbackCount.get())
     }
 
     @Test
@@ -247,49 +246,123 @@ internal class SnowflakeDirectLoadDatabaseInitialStatusGathererTest {
     }
 
     @Test
-    fun testFallsBackOnRowCap() {
-        val streamA = stream("NS_A", "USERS")
-        val streamB = stream("NS_B", "USERS")
-        val streams = listOf(streamA, streamB)
-        addTable(streamA.finalTable(), rows = 9)
-        addTable(streamB.finalTable(), rows = 0)
+    fun testFailsOnRowCapWithoutPerTableQueries() {
+        val requested = stream("NS_A", "USERS")
+        addTable(requested.finalTable(), rows = 9)
         repeat(SHOW_TABLES_ROW_CAP - 1) { addTable(TableName("NS_A", "FILLER_$it"), rows = 1) }
 
-        val result = runBlocking { gatherer(streams).gatherInitialStatus() }
-        val batchQueries = executedQueries.toList()
+        val exception =
+            assertThrows<IllegalStateException> {
+                runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+            }
 
-        assertEquals(runBlocking { perTableGatherer(streams).gatherInitialStatus() }, result)
-        assertEquals(DirectLoadTableStatus(isEmpty = false), result[streamA]!!.realTable)
-        assertEquals(DirectLoadTableStatus(isEmpty = true), result[streamB]!!.realTable)
-        // NS_A fell back to the per-table path; NS_B did not.
-        assertTrue(batchQueries.contains("LIKE|NS_A|USERS"))
-        assertTrue(batchQueries.none { it.startsWith("LIKE|NS_B|") })
-        assertEquals(1L, client.batchFallbackCount.get())
-        assertEquals(1L, client.batchFallbackCapCount.get())
-        assertEquals(0L, client.batchFallbackErrorCount.get())
+        assertTrue(exception.message!!.contains("NS_A"))
+        assertTrue(exception.message!!.contains("10000"))
+        assertTrue(exception.message!!.contains("truncated"))
+        assertTrue(executedQueries.none { it.startsWith("LIKE") })
+        assertTrue(client.lastBatchComments.isEmpty())
     }
 
     @Test
-    fun testFallsBackOnException() {
-        val streamA = stream("NS_A", "USERS")
-        val streamB = stream("NS_B", "USERS")
-        val streams = listOf(streamA, streamB)
-        addTable(streamA.finalTable(), rows = 0)
-        addTable(streamA.tempTable(), rows = 4)
-        addTable(streamB.finalTable(), rows = 2)
+    fun testListingBelowCapResolvesWithoutPerTableQueries() {
+        val requested = stream("NS_A", "USERS")
+        addTable(requested.finalTable(), rows = 9)
+        repeat(SHOW_TABLES_ROW_CAP - 2) { addTable(TableName("NS_A", "FILLER_$it"), rows = 1) }
+
+        val result = runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+
+        assertEquals(DirectLoadTableStatus(isEmpty = false), result[requested]!!.realTable)
+        assertTrue(executedQueries.none { it.startsWith("LIKE") })
+    }
+
+    @Test
+    fun testSqlErrorStopsDiscoveryWithoutPublishingPartialComments() {
+        val requested = stream("NS_A", "USERS")
+        addTable(requested.finalTable(), rows = 0, comment = "airbyte-schema:v1:0123456789abcdef")
         failingQuery = { it.startsWith("SHOW_SW|") }
 
-        val result = runBlocking { gatherer(streams).gatherInitialStatus() }
-        val batchQueries = executedQueries.toList()
+        val exception =
+            assertThrows<IllegalStateException> {
+                runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+            }
 
-        assertEquals(runBlocking { perTableGatherer(streams).gatherInitialStatus() }, result)
-        assertEquals(DirectLoadTableStatus(isEmpty = false), result[streamA]!!.tempTable)
-        assertNull(result[streamB]!!.tempTable)
-        assertTrue(batchQueries.contains("LIKE|$internalNamespace|${streamA.tempTable().name}"))
-        assertTrue(batchQueries.none { it.startsWith("LIKE|NS_") })
-        assertEquals(2L, client.batchFallbackCount.get())
-        assertEquals(0L, client.batchFallbackCapCount.get())
-        assertEquals(2L, client.batchFallbackErrorCount.get())
+        assertTrue(exception.message!!.contains(internalNamespace))
+        assertTrue(exception.message!!.contains("SHOW_SW"))
+        assertTrue(exception.cause is SQLException)
+        assertTrue(exception.cause!!.message!!.contains("boom"))
+        assertTrue(executedQueries.none { it.startsWith("LIKE") })
+        assertNull(client.lastBatchComments[requested.finalTable()])
+    }
+
+    @Test
+    fun testUnsafeTempPrefixFailsWithoutListingSharedSchema() {
+        val requested = stream("NS_A", "USERS", TableName(internalNamespace, "UNRELATED_TEMP"))
+
+        val exception =
+            assertThrows<IllegalStateException> {
+                runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+            }
+
+        assertTrue(exception.message!!.contains("UNRELATED_TEMP"))
+        assertTrue(exception.message!!.contains("NS_A"))
+        assertTrue(executedQueries.isEmpty())
+    }
+
+    @Test
+    fun testAmbiguousCaseInsensitiveNameFails() {
+        val requested = stream("NS_A", "uSeRs")
+        addTable(TableName("NS_A", "USERS"), rows = 1)
+        addTable(TableName("NS_A", "users"), rows = 0)
+
+        val exception =
+            assertThrows<IllegalStateException> {
+                runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+            }
+
+        assertTrue(exception.message!!.contains("Ambiguous"))
+        assertTrue(exception.message!!.contains("uSeRs"))
+        assertTrue(executedQueries.none { it.startsWith("LIKE") })
+    }
+
+    @Test
+    fun testUniqueCaseInsensitiveNameStillResolves() {
+        val requested = stream("NS_A", "users")
+        addTable(TableName("NS_A", "USERS"), rows = 1)
+
+        val result = runBlocking { gatherer(listOf(requested)).gatherInitialStatus() }
+
+        assertEquals(DirectLoadTableStatus(isEmpty = false), result[requested]!!.realTable)
+    }
+
+    @Test
+    fun testMissingTableNamesFailWithStreamContextBeforeQueries() {
+        val requested = stream("NS_A", "USERS")
+        val schema = requested.tableSchema
+        val missingNames =
+            listOf(
+                TableNames(
+                    rawTableName = TableName("NS_A", "RAW_USERS"),
+                    finalTableName = null,
+                    tempTableName = requested.tempTable(),
+                ),
+                TableNames(finalTableName = requested.finalTable(), tempTableName = null),
+            )
+        missingNames.forEach { names ->
+            every { requested.tableSchema } returns schema.copy(tableNames = names)
+            val exception =
+                assertThrows<IllegalArgumentException> {
+                    runBlocking { client.batchGatherTableStatus(listOf(requested)) }
+                }
+            assertTrue(exception.message!!.contains("NS_A"))
+            assertTrue(exception.message!!.contains("USERS"))
+        }
+        assertTrue(executedQueries.isEmpty())
+    }
+
+    @Test
+    fun testEmptyCatalogIsRejectedBeforeQueries() {
+        assertThrows<IllegalArgumentException> { gatherer(emptyList()) }
+        assertTrue(executedQueries.isEmpty())
     }
 
     @Test
@@ -357,6 +430,5 @@ internal class SnowflakeDirectLoadDatabaseInitialStatusGathererTest {
         assertNull(client.lastBatchComments[streamInNewNamespace.finalTable()])
         assertTrue(client.lastBatchComments.isEmpty())
         assertTrue(executedQueries.none { it.startsWith("LIKE") })
-        assertEquals(0L, client.batchFallbackCount.get())
     }
 }

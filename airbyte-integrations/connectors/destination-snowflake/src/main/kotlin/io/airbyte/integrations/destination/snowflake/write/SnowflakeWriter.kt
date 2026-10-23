@@ -55,10 +55,7 @@ class SnowflakeWriter(
     override suspend fun teardown(hadFailure: Boolean) {
         log.info {
             "Snowflake metadata summary: " +
-                "schemaChecksSkipped=${snowflakeClient.schemaCheckSkipCount.get()} " +
-                "batchFallbacks=${snowflakeClient.batchFallbackCount.get()} " +
-                "(cap=${snowflakeClient.batchFallbackCapCount.get()}, " +
-                "error=${snowflakeClient.batchFallbackErrorCount.get()})"
+                "schemaChecksSkipped=${snowflakeClient.schemaCheckSkipCount.get()}"
         }
     }
 

@@ -42,8 +42,8 @@ internal const val DESCRIBE_TABLE_COLUMN_TYPE_FIELD = "data_type"
 internal const val SCHEMA_FINGERPRINT_PREFIX = "airbyte-schema:v1:"
 
 /**
- * SHOW commands return at most this many rows. A result of this size may be truncated, so the
- * batched lookup falls back to per-table queries for that group.
+ * SHOW commands return at most this many rows. A result of this size may be truncated, so the sync
+ * fails rather than treating a possibly incomplete listing as table absence.
  */
 internal const val SHOW_TABLES_ROW_CAP = 10_000
 
@@ -90,33 +90,41 @@ class SnowflakeAirbyteClient(
     /** Number of ensureSchemaMatches calls skipped because the fingerprint matched. */
     val schemaCheckSkipCount = AtomicLong()
 
-    /** Number of batched SHOW groups that fell back to per-table lookups (any cause). */
-    val batchFallbackCount = AtomicLong()
-    val batchFallbackCapCount = AtomicLong()
-    val batchFallbackErrorCount = AtomicLong()
-
     /** A single batched SHOW TABLES query and the tables whose status it resolves. */
-    private data class ShowTablesGroup(val sql: String, val tables: List<TableName>)
+    private data class ShowTablesGroup(
+        val namespace: String,
+        val sql: String,
+        val tables: List<TableName>,
+    )
 
     /**
      * Resolves the status of every final and temp table of [streams] with one SHOW TABLES per final
      * namespace, plus one SHOW TABLES STARTS WITH per temp-table prefix in the internal namespace.
      *
-     * The returned map contains:
-     * - `table -> entry` when the table was found,
-     * - `table -> null` when a successful SHOW did not list it (missing table),
-     * - no key when its group fell back (row cap reached or SQL error); callers must resolve such
-     * tables with [countTable].
-     *
-     * Name matching: an exact (case-sensitive) name match is preferred; otherwise a
-     * case-insensitive match is used, mirroring the case-insensitivity of the previous `SHOW TABLES
-     * LIKE ?` lookup (but without its `_`/`%` wildcard matching, which could match other tables).
+     * The returned map contains every requested table: a status entry when found, or null when a
+     * complete listing did not contain that table. SQL errors and potentially truncated listings
+     * fail the sync. An exact name wins; otherwise a unique case-insensitive match is accepted.
+     * Ambiguous case-insensitive names fail rather than choosing an arbitrary table.
      */
     internal suspend fun batchGatherTableStatus(
         streams: Collection<DestinationStream>
     ): Map<TableName, TableStatusEntry?> {
-        val finalTables = streams.mapNotNull { it.tableSchema.tableNames.finalTableName }.toSet()
-        val tempTables = streams.mapNotNull { it.tableSchema.tableNames.tempTableName }.toSet()
+        val finalTables =
+            streams
+                .map { stream ->
+                    requireNotNull(stream.tableSchema.tableNames.finalTableName) {
+                        "Missing final table name for stream ${stream.mappedDescriptor.toPrettyString()}"
+                    }
+                }
+                .toSet()
+        val tempTables =
+            streams
+                .map { stream ->
+                    requireNotNull(stream.tableSchema.tableNames.tempTableName) {
+                        "Missing temp table name for stream ${stream.mappedDescriptor.toPrettyString()}"
+                    }
+                }
+                .toSet()
         val finalNamespaces = finalTables.map { it.namespace }.toSet()
 
         val groups =
@@ -124,7 +132,13 @@ class SnowflakeAirbyteClient(
                 .groupBy { it.namespace }
                 .flatMap { (namespace, tables) ->
                     if (namespace in finalNamespaces) {
-                        listOf(ShowTablesGroup(sqlGenerator.showTablesInSchema(namespace), tables))
+                        listOf(
+                            ShowTablesGroup(
+                                namespace,
+                                sqlGenerator.showTablesInSchema(namespace),
+                                tables
+                            )
+                        )
                     } else {
                         tempTableGroups(namespace, tables, streams)
                     }
@@ -132,8 +146,11 @@ class SnowflakeAirbyteClient(
 
         val result = HashMap<TableName, TableStatusEntry?>()
         groups.forEach { group ->
-            val listing = runShowTables(group.sql) ?: return@forEach
-            group.tables.forEach { table -> result[table] = listing.lookup(table.name) }
+            val listing = runShowTables(group)
+            group.tables.forEach { table ->
+                result[table] =
+                    listing.lookup(table.name, "$databaseName.${table.toPrettyString()}")
+            }
         }
 
         result.forEach { (table, entry) ->
@@ -151,8 +168,8 @@ class SnowflakeAirbyteClient(
      * Temp tables live in a shared internal namespace. Their names start with the first and last
      * [TEMP_TABLE_NAMESPACE_AFFIX_LENGTH] characters of the final namespace, so each distinct
      * prefix is listed with SHOW TABLES STARTS WITH. The prefix is verified against the actual temp
-     * table name; if any table cannot be given a safe prefix, the whole namespace is listed
-     * instead.
+     * table name. A naming mismatch fails with table context instead of querying every tenant's
+     * temporary tables in the shared schema.
      */
     private fun tempTableGroups(
         namespace: String,
@@ -161,29 +178,34 @@ class SnowflakeAirbyteClient(
     ): List<ShowTablesGroup> {
         val finalNamespaceByTemp =
             streams
-                .mapNotNull { stream ->
+                .map { stream ->
                     val names = stream.tableSchema.tableNames
-                    val temp = names.tempTableName ?: return@mapNotNull null
-                    val final = names.finalTableName ?: return@mapNotNull null
-                    temp to final.namespace
+                    names.tempTableName!! to names.finalTableName!!.namespace
                 }
                 .toMap()
 
         val prefixes =
             tables.associateWith { table ->
-                finalNamespaceByTemp[table]
-                    ?.let { tempTablePrefix(it) }
-                    ?.takeIf { it.isNotEmpty() && !it.contains(QUOTE) && table.name.startsWith(it) }
+                val finalNamespace =
+                    checkNotNull(finalNamespaceByTemp[table]) {
+                        "Cannot find the final namespace for temp table $databaseName.${table.toPrettyString()}"
+                    }
+                val prefix = tempTablePrefix(finalNamespace)
+                check(
+                    prefix.isNotEmpty() && !prefix.contains(QUOTE) && table.name.startsWith(prefix)
+                ) {
+                    "Cannot derive a safe temp table prefix for $databaseName.${table.toPrettyString()} " +
+                        "from final namespace $finalNamespace"
+                }
+                prefix
             }
 
-        if (prefixes.values.any { it == null }) {
-            log.info {
-                "Cannot derive a safe temp table prefix in namespace $namespace; listing the whole schema"
-            }
-            return listOf(ShowTablesGroup(sqlGenerator.showTablesInSchema(namespace), tables))
-        }
-        return prefixes.entries.groupBy({ it.value!! }, { it.key }).map { (prefix, prefixTables) ->
-            ShowTablesGroup(sqlGenerator.showTablesStartsWith(prefix, namespace), prefixTables)
+        return prefixes.entries.groupBy({ it.value }, { it.key }).map { (prefix, prefixTables) ->
+            ShowTablesGroup(
+                namespace,
+                sqlGenerator.showTablesStartsWith(prefix, namespace),
+                prefixTables
+            )
         }
     }
 
@@ -197,26 +219,29 @@ class SnowflakeAirbyteClient(
     }
 
     private class ShowTablesListing(private val byName: Map<String, TableStatusEntry>) {
-        private val byUppercaseName: Map<String, TableStatusEntry> =
-            byName.entries
-                .groupBy { it.key.uppercase() }
-                .mapValues { (_, entries) -> entries.first().value }
+        private val byUppercaseName = byName.entries.groupBy { it.key.uppercase() }
 
-        fun lookup(name: String): TableStatusEntry? =
-            byName[name] ?: byUppercaseName[name.uppercase()]
+        fun lookup(name: String, tableContext: String): TableStatusEntry? {
+            byName[name]?.let {
+                return it
+            }
+            val matches = byUppercaseName[name.uppercase()].orEmpty()
+            check(matches.size <= 1) {
+                "Ambiguous case-insensitive table metadata for $tableContext: " +
+                    "${matches.map { it.key }}; an exact table name is required"
+            }
+            return matches.singleOrNull()?.value
+        }
     }
 
-    /**
-     * Runs a SHOW TABLES query. Returns null (after recording a fallback) if the result may be
-     * truncated or the query fails.
-     */
-    private fun runShowTables(sql: String): ShowTablesListing? {
+    /** Read one complete metadata group, or fail with its schema and query context. */
+    private fun runShowTables(group: ShowTablesGroup): ShowTablesListing {
+        val entries = LinkedHashMap<String, TableStatusEntry>()
+        var rowCount = 0
         try {
-            val entries = LinkedHashMap<String, TableStatusEntry>()
-            var rowCount = 0
             dataSource.connection.use { connection ->
                 connection.createStatement().use { statement ->
-                    statement.executeQuery(sql).use { rs ->
+                    statement.executeQuery(group.sql).use { rs ->
                         while (rs.next()) {
                             rowCount++
                             entries.putIfAbsent(
@@ -227,21 +252,19 @@ class SnowflakeAirbyteClient(
                     }
                 }
             }
-            if (rowCount >= SHOW_TABLES_ROW_CAP) {
-                batchFallbackCount.incrementAndGet()
-                batchFallbackCapCount.incrementAndGet()
-                log.warn {
-                    "Batched table lookup returned $rowCount rows (cap $SHOW_TABLES_ROW_CAP); falling back to per-table lookups"
-                }
-                return null
-            }
-            return ShowTablesListing(entries)
         } catch (e: SQLException) {
-            batchFallbackCount.incrementAndGet()
-            batchFallbackErrorCount.incrementAndGet()
-            log.warn(e) { "Batched table lookup failed; falling back to per-table lookups" }
-            return null
+            throw IllegalStateException(
+                "Cannot discover table metadata in $databaseName.${group.namespace} " +
+                    "using query: ${group.sql}",
+                e,
+            )
         }
+        check(rowCount < SHOW_TABLES_ROW_CAP) {
+            "Cannot verify complete table metadata in $databaseName.${group.namespace}: " +
+                "query returned $rowCount rows at the SHOW limit of $SHOW_TABLES_ROW_CAP; " +
+                "refusing a potentially truncated listing. Query: ${group.sql}"
+        }
+        return ShowTablesListing(entries)
     }
 
     override suspend fun countTable(tableName: TableName): Long? {
@@ -448,9 +471,9 @@ class SnowflakeAirbyteClient(
 
         /*
          * The final table's comment records the fingerprint of the catalog-derived schema that was
-         * last reconciled into it. If it equals the expected fingerprint, DESCRIBE + ALTER would be
-         * a no-op, which is what makes the skip safe in every loader mode. The skip is further
-         * narrowed to streams whose temp table is still unmaterialized (zero-record streams).
+         * last reconciled into it. Quiet streams whose temp tables remain unmaterialized may reuse
+         * that marker. It is not a fresh inspection of the physical table: a column dropped outside
+         * Airbyte is repaired when records arrive or the catalog schema changes.
          */
         val names = stream.tableSchema.tableNames
         val expected = computeFingerprint(computeSchema(stream, columnNameMapping))
@@ -470,15 +493,17 @@ class SnowflakeAirbyteClient(
         super.ensureSchemaMatches(stream, tableName, columnNameMapping)
 
         if (isFinalTable && lastBatchComments[tableName] != expected) {
+            val message =
+                "Cannot record schema fingerprint on $databaseName.${tableName.toPrettyString()} " +
+                    "after schema reconciliation"
             try {
                 execute(sqlGenerator.commentOnTable(tableName, expected))
-                lastBatchComments[tableName] = expected
-            } catch (e: Exception) {
-                // Not fatal: without a fingerprint the next sync simply reconciles again.
-                log.warn(e) {
-                    "Failed to record schema fingerprint on ${tableName.toPrettyString()}; the next sync will re-check its schema"
-                }
+            } catch (e: ConfigErrorException) {
+                throw ConfigErrorException(message, e)
+            } catch (e: SQLException) {
+                throw IllegalStateException(message, e)
             }
+            lastBatchComments[tableName] = expected
         }
     }
 
